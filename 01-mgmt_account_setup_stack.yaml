@@ -1,0 +1,194 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Deploy resources in management account to create cross account access and update cost allocation tag status of all member accounts
+
+Parameters:
+  AllowedMemberAccountIds:
+    Description: List of member account ids seperated by commas
+    Type: CommaDelimitedList
+    Default: ""
+  AllowedOrgIds:
+    Description: List of Organization IDs seperated by commas
+    Type: CommaDelimitedList
+    ConstraintDescription: You must provide an AWS Organization Id 
+    AllowedPattern: '^(?!\s*$).+'
+
+Conditions: 
+  AllowedMemberAccountIdsNotEmpty: !Not [!Equals [!Join ["",!Ref AllowedMemberAccountIds],'']]
+  AllowedOrgIdsNotEmpty: !Not [!Equals [!Join ["",!Ref AllowedOrgIds],'']]
+
+Outputs:
+  CrossAccountRoleName: 
+    Description: Role Name to be used in child account stack deployment
+    Value: !Ref AccountTagCrossRole
+
+Resources:
+  EventRule:
+    # Create event rule for new portfolio creation or share API to invoke CE lambda.
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "aws-ce-lambda-schedule-run-${AWS::Region}-event-rule"  
+      Description: "Event Rule to run UpdateCostAllocationTagStatusLambdaFunction"
+      #EventPattern: "{ \"source\": [\"aws.servicecatalog\"], \"detail\": { \"eventSource\": [\"servicecatalog.amazonaws.com\"], \"eventName\": [\"CreatePortfolioShare\",\"CreatePortfolio\"]}}"
+      ScheduleExpression: cron(0 11 * * ? *)
+      Targets:
+        - Arn: !GetAtt UpdateCostAllocationTagStatusLambdaFunction.Arn
+          Id: "run-create-event-lambda-target"
+
+  InvokeLambdaPermission:
+    # Add Lambda Invokation permission
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UpdateCostAllocationTagStatusLambdaFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventRule.Arn 
+
+  UpdateCostAllocationTagStatusLambdaFunction:
+  # Lambda to extract account level tags and update cost allocation tag status 
+    Type: AWS::Lambda::Function
+    #checkov:skip=CKV_AWS_117:VPC configuration is skiiped in POC
+    #checkov:skip=CKV_AWS_116:DLQ configuration is skipped in POC
+    #checkov:skip=CKV_AWS_115:Concurrent Execution is skipped in POC to avoid additional cost
+    Properties: 
+      FunctionName: !Sub "update-cost-allocation-tag-status-${AWS::Region}-function" 
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Description: Lambda function to update cost allocation tag status for billing
+      Role: !GetAtt CELambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def list_all_accounts(org_client, next_token=None,all_accounts=None):
+              if all_accounts is None:
+                  all_accounts = []
+              if next_token:
+                  response = org_client.list_accounts(NextToken=next_token)
+              else:
+                  response = org_client.list_accounts()
+              
+              all_accounts.extend(response['Accounts'])
+              next_token = response.get('NextToken')
+              
+              if next_token:
+                  return list_all_accounts(org_client,next_token,all_accounts)
+              
+              return all_accounts
+
+          def list_all_tags_for_account(org_client, account_id, next_token=None, all_tags=None):
+              if all_tags is None:
+                  all_tags = []
+              if next_token:
+                  response = org_client.list_tags_for_resource(ResourceId=account_id,NextToken=next_token)
+              else:
+                  response = org_client.list_tags_for_resource(ResourceId=account_id)
+              
+              all_tags.extend(response['Tags'])
+              next_token = response.get('NextToken')
+              
+              if next_token:
+                  return list_all_tags_for_account(org_client,account_id,next_token,all_tags)
+              
+              return all_tags
+
+          def lambda_handler(event, context):    
+            org_client= boto3.client('organizations')
+            ce_client = boto3.client('ce')
+            all_accounts = list_all_accounts(org_client)
+
+            for account in all_accounts:   
+                all_tags = list_all_tags_for_account(org_client,account['Id'])
+                
+                if(all_tags != []):
+                    logger.info(account['Id'])
+                    logger.info("*************")
+                    logger.info(all_tags)
+                    for key in all_tags:
+                        try:
+                            logger.info(f"Activation CE tag: {key['Key']}")
+                            response = ce_client.update_cost_allocation_tags_status(
+                                    CostAllocationTagsStatus=[
+                                    {
+                                        'TagKey': key['Key'],
+                                        'Status': 'Active'
+                                    },
+                                    ])
+                        except Exception as e:
+                            logger.info(e)      
+
+  CELambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "update-cost-allocation-tag-status-role" 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: lambda-policy1
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - organizations:ListTagsForResource
+              - organizations:ListAccounts
+              - ce:UpdateCostAllocationTagsStatus
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+            - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+
+  AccountTagCrossRole:
+    # Cross account access role
+    #checkov:skip=CKV_AWS_60:Condition to PrincipalOrgID is present
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "org-cross-account-trustee-role" 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS:
+              Fn::If:
+                - AllowedMemberAccountIdsNotEmpty
+                - !Ref AllowedMemberAccountIds
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+          Action:
+          - sts:AssumeRole
+        - Effect: Allow
+          Principal:
+            AWS: "*"
+          Action:
+          - sts:AssumeRole
+          Condition: 
+            StringEquals: 
+              aws:PrincipalOrgID: !If [AllowedOrgIdsNotEmpty, !Ref AllowedOrgIds, !Ref 'AWS::NoValue' ]
+      Path: "/"
+      Policies:
+      - PolicyName: lambda-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - organizations:ListTagsForResource
+            Resource:
+            - "*" 

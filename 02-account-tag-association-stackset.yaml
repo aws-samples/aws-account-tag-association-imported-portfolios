@@ -1,0 +1,318 @@
+
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+
+#This Lambda Function synchronizes Service Catalog Tag Option with the Account level Tags retrieved from AWS Organization.
+#It creates tagOptions based on the account level tags and associates them with the portfolios in Service Catalog
+#As this lambda has multiple API calls, it is advised to set execution time to >3 minutes.
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  This template synchronizes Service Catalog Tag Option with the Account level Tags retrieved from AWS Organization. It also contains custom lambda for invocation after deployment
+
+Parameters: 
+  OrganizationCrossAccountTrusteeRole: 
+    Type: String
+    Description: "Supply the role name in management account" 
+    Default: "org-cross-account-trustee-role"
+  MgmtAccountId:
+    Type: String
+    Description: Mgmt account ID to be passed at runtime
+
+Resources:
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "aws-acct-tag-associate-${AWS::Region}-event-rule"  
+      Description: "Event Rule to look for Service Catalog Portfolio Creation"
+      EventPattern: "{ \"source\": [\"aws.servicecatalog\"], \"detail\": { \"eventSource\": [\"servicecatalog.amazonaws.com\"], \"eventName\": [\"AcceptPortfolioShare\",\"CreatePortfolio\"]}}"
+      Targets:
+        - Arn: !GetAtt TagAssociationLambda.Arn
+          Id: "portfolio-create-event-lambda-target"
+
+  TagAssociationLambda:
+    #checkov:skip=CKV_AWS_116:DLQ configuration is skipped in POC
+    #checkov:skip=CKV_AWS_117:VPC configuration is skipped in POC
+    #checkov:skip=CKV_AWS_173:KMS configuration is skipped in POC. Environment varialbe is used to store the rolename and not sensitive.
+    #checkov:skip=CKV_AWS_115:Concurrent Execution is skipped in POC to avoid additional cost
+    #checkov:skip=CKV_SECRET_6:Secrets are not hardcoded"
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "aws-acct-tag-associate-${AWS::Region}-function"
+      Runtime: "python3.11"
+      Handler: index.lambda_handler
+      Environment: 
+        Variables: 
+          #ACCOUNT_ID: !Sub ${AWS::AccountId}
+          ORG_CROSS_ROLE: !Sub "arn:aws:iam::${MgmtAccountId}:role/${OrganizationCrossAccountTrusteeRole}"
+      Role: !GetAtt TagAssociationLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          print('Loading function')
+
+
+          def lambda_handler(event, context):
+              ce_client = boto3.client('ce')
+              org_cross_role = os.environ['ORG_CROSS_ROLE']
+              sts_client = boto3.client('sts')
+
+              account_id = sts_client.get_caller_identity()['Account']
+              acct_tool = sts_client.assume_role(
+                  RoleArn=org_cross_role,
+                  RoleSessionName="cross_acct_lambda")
+
+              ACCESS_KEY = acct_tool['Credentials']['AccessKeyId']
+              SECRET_KEY = acct_tool['Credentials']['SecretAccessKey']
+              SESSION_TOKEN = acct_tool['Credentials']['SessionToken']
+
+              # Create clients for AWS Organizations and AWS ServiceCatalog
+              orgs_client = boto3.client('organizations',
+                                        aws_access_key_id=ACCESS_KEY,
+                                        aws_secret_access_key=SECRET_KEY,
+                                        aws_session_token=SESSION_TOKEN)
+
+              orgs_session = boto3.session.Session()
+              orgs_region = orgs_session.region_name
+              logger.info(f'Region: ${orgs_region}')
+
+              sc_client = boto3.client('servicecatalog')
+
+              # Retrieve tags for the AWS Account using Organizaation API
+              acct_tagset = orgs_client.list_tags_for_resource(ResourceId=account_id)
+              account_tags = {tag['Key']: tag['Value']
+                              for tag in acct_tagset.get('Tags', [])}
+              logger.info(f'account_tag: ${account_tags}')
+
+              # Retrieve existing tag options from ServiceCatalog
+              tag_options_response = sc_client.list_tag_options()
+              existing_tag_options = tag_options_response.get('TagOptionDetails', [])
+              logger.info(f'existing_tag_options: ${existing_tag_options}')
+
+              for key, value in account_tags.items():
+                  logger.info(f'{key} : {value}')
+                  tag_option_id = None
+                  try:
+                      for existing_tag_option in existing_tag_options:
+                          if existing_tag_option['Key'] == key and existing_tag_option['Value'] == value:
+                              tag_option_id = existing_tag_option['Id']
+                              break
+                      # Create TagOption is doesn't exist
+                      if tag_option_id is None:
+                          logger.info(f"{key} : {value} ==> New Tag Found")
+                          tag_option_response = sc_client.create_tag_option(
+                              Key=key, Value=value)
+                          tag_option_id = tag_option_response['TagOptionDetail']['Id']
+
+                          # logger.info(f'Activating CE for account tag key : {key}')
+                          # response = ce_client.update_cost_allocation_tags_status(
+                          # CostAllocationTagsStatus=[
+                          #     {
+                          #         'TagKey': key,
+                          #         'Status': 'Active'
+                          #     },])
+
+                      portfolios_response = sc_client.list_accepted_portfolio_shares(
+                          PortfolioShareType='IMPORTED')
+                      for portfolio in portfolios_response['PortfolioDetails']:
+                          # Check if the tag option already associated to portfolio
+                          existing_associations = sc_client.list_resources_for_tag_option(
+                              TagOptionId=tag_option_id).get('ResourceDetails', [])
+                          if not any(resource.get('Id') == portfolio['Id'] for resource in existing_associations):
+                              # Associate tagoption to porfolio
+                              sc_client.associate_tag_option_with_resource(
+                                  ResourceId=portfolio['Id'], TagOptionId=tag_option_id)
+                              logger.info(
+                                  f'TagOption associated to {portfolio["DisplayName"]}')
+
+                      portfolios_response = sc_client.list_portfolios()
+                      for portfolio in portfolios_response['PortfolioDetails']:
+                          acct_tag_list = [{'Key': key, 'Value': value}
+                                          for key, value in account_tags.items()]
+                          logger.info(acct_tag_list)
+                          sc_client.update_portfolio(
+                              Id=portfolio['Id'], AddTags=acct_tag_list)
+                          logger.info(f'Tags added to {portfolio["DisplayName"]}')
+
+
+                  except Exception as e:
+                      logger.info(e)
+
+
+  TagAssociationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "aws-cross-account-trusted-${AWS::Region}-role" 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+              - Effect: Allow
+                Action:
+                  - organizations:ListTagsForResource
+                Resource:
+                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+              - Effect: Allow
+                Action:
+                  - servicecatalog:ListPortfolios
+                  - servicecatalog:CreateTagOption
+                  - servicecatalog:UpdateTagOption
+                  - servicecatalog:ListResourcesForTagOption
+                  - servicecatalog:AssociateTagOptionWithResource
+                  - servicecatalog:ListTagOptions
+                  - servicecatalog:ListAcceptedPortfolioShares
+                  - servicecatalog:UpdatePortfolio
+                  - ce:UpdateCostAllocationTagsStatus
+                Resource:
+                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${MgmtAccountId}:role/${OrganizationCrossAccountTrusteeRole}"
+
+  InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TagAssociationLambda
+      Principal: events.amazonaws.com
+      # To add specific source as condition to lambda permission include SourceArn. 
+      SourceArn: !GetAtt EventRule.Arn 
+
+  InvokeLambda:
+    Type: Custom::LambdaTrigger
+    DependsOn: TagAssociationLambda
+    Properties:
+      ServiceToken: !GetAtt InvokeLambdaFunction.Arn
+      FunctionName: !Ref TagAssociationLambda
+  
+  InvokeLambdaFunction:
+    #checkov:skip=CKV_AWS_116:DLQ configuration is skipped in POC
+    #checkov:skip=CKV_AWS_117:VPC configuration is skipped in POC
+    #checkov:skip=CKV_AWS_173:KMS configuration is skipped in POC
+    #checkov:skip=CKV_AWS_115:Concurrent Execution is skipped in POC to avoid additional cost
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: !Sub "custom-invocation-firsttime-${AWS::Region}-function" 
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Description: Lambda to invoke Account Tag Lambda function
+      Role: !GetAtt InvokeLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          from urllib.request import Request, urlopen
+          import json
+          import boto3
+          import cfnresponse
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          print('Loading function')
+          lambda_client = boto3.client('lambda')
+
+          def lambda_handler(event, context):
+              request_type = event['RequestType']
+
+              try:
+                  logger.info(request_type)
+                  if request_type in ['Create', 'Update']:
+                      lambda_client = boto3.client('lambda')
+                      logger.info("Loading Function")
+                      responseData = lambda_client.invoke(
+                          FunctionName=event['ResourceProperties']['FunctionName'],
+                          InvocationType='Event',
+                          Payload='{}'
+                      )
+                      send_response(event, context, "SUCCESS",
+                                      {"Message": "Invoked"})
+
+                  elif request_type == 'Delete':
+                      send_response(event, context, "SUCCESS",
+                                      {"Message": "Deleted"})
+
+                  else:
+                      send_response(event, context, "FAILED",
+                                      {"Message": "Unexpected"})
+              except Exception as ex:
+                  logger.error(ex)
+                  send_response(event, context, "FAILED",
+                                  {"Message": "Exception"})
+
+          def send_response(e, c, rs, rd):
+              r = json.dumps({
+                  "Status": rs,
+                  "Reason": "CloudWatch Log Stream: " + c.log_stream_name,
+                  "PhysicalResourceId": c.log_stream_name,
+                  "StackId": e['StackId'],
+                  "RequestId": e['RequestId'],
+                  "LogicalResourceId": e['LogicalResourceId'],
+                  "Data": rd
+              })
+              d = str.encode(r)
+              h = {
+                  'content-type': '',
+                  'content-length': str(len(d))
+              }
+              req = Request(e['ResponseURL'], data=d, method='PUT', headers=h)
+              r = urlopen(req)
+              logger.info("Status message: {} {}".format(r.msg, r.getcode()))
+
+  InvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "aws-acct-tag-associate-${AWS::Region}-invoke-lambda-role" 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: invoke-lambda-policy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - !GetAtt TagAssociationLambda.Arn
