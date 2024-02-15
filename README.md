@@ -1,8 +1,5 @@
 // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-
 // SPDX-License-Identifier: MIT-0
-
-
 # Automated ResourceManagement for AWS Service Catalog Portfolios tags association from Account Tags using Lambda Function
 
 ## Description

@@ -206,7 +206,7 @@ Resources:
 
   InvokeLambda:
     Type: Custom::LambdaTrigger
-    DependsOn: TagAssociationLambda
+    #DependsOn: TagAssociationLambda
     Properties:
       ServiceToken: !GetAtt InvokeLambdaFunction.Arn
       FunctionName: !Ref TagAssociationLambda
