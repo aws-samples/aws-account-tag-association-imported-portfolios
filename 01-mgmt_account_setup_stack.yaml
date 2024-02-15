@@ -2,10 +2,8 @@
 # SPDX-License-Identifier: MIT-0
 
 AWSTemplateFormatVersion: '2010-09-09'
-
 Description: >
   Deploy resources in management account to create cross account access and update cost allocation tag status of all member accounts
-
 Parameters:
   AllowedMemberAccountIds:
     Description: List of member account ids seperated by commas
