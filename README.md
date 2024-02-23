@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT-0
 # Automated ResourceManagement for AWS Service Catalog Portfolios tags association from Account Tags using Lambda Function
 
-
 ## Description
 
 This project is designed to automate associating account level tags to shared and local portfolios in the AWS environment which inturn inherits the tags to launched resources. AWS ServiceCatalog TagOption feature is used for this association. 
