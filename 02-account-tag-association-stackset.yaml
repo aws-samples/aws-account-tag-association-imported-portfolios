@@ -172,12 +172,12 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource:
-                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+                  - "*"
               - Effect: Allow
                 Action:
                   - organizations:ListTagsForResource
                 Resource:
-                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+                  - "*"
               - Effect: Allow
                 Action:
                   - servicecatalog:ListPortfolios
@@ -190,7 +190,7 @@ Resources:
                   - servicecatalog:UpdatePortfolio
                   - ce:UpdateCostAllocationTagsStatus
                 Resource:
-                  - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+                  - !Sub "*"
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub "arn:aws:iam::${MgmtAccountId}:role/${OrganizationCrossAccountTrusteeRole}"
@@ -310,7 +310,7 @@ Resources:
             - logs:CreateLogStream
             - logs:PutLogEvents
             Resource:
-            - !Sub arn:aws:lambda:*:${AWS::AccountId}:function:*
+            - !Sub "*"
           - Effect: Allow
             Action:
             - lambda:InvokeFunction
