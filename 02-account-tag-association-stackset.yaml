@@ -190,7 +190,7 @@ Resources:
                   - servicecatalog:UpdatePortfolio
                   - ce:UpdateCostAllocationTagsStatus
                 Resource:
-                  - !Sub "*"
+                  - "*"
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub "arn:aws:iam::${MgmtAccountId}:role/${OrganizationCrossAccountTrusteeRole}"
@@ -309,8 +309,7 @@ Resources:
             - logs:CreateLogGroup
             - logs:CreateLogStream
             - logs:PutLogEvents
-            Resource:
-            - !Sub "*"
+            Resource: "*"
           - Effect: Allow
             Action:
             - lambda:InvokeFunction
